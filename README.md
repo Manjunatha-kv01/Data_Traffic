@@ -323,4 +323,4 @@ This project is provided as-is for educational and development purposes.
 
 # Expected Output
 
- ![image alt](image url) 
+ ![image alt](https://github.com/Manjunatha-kv01/Data_Traffic/blob/main/image/Swagger_Output.png) 
