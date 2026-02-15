@@ -68,6 +68,7 @@ Data.traffic/
 └── myenv/            # Python virtual environment
 ```
 
+
 ---
 
 ## Step-by-Step Setup Guide
@@ -318,3 +319,8 @@ curl -X POST http://localhost:8000/traffic/summary \
 ## License
 
 This project is provided as-is for educational and development purposes.
+
+
+# Expected Output
+
+ ![image alt](image url) 
