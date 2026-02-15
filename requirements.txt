@@ -6,3 +6,4 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.22
 pydantic==2.12.5
 bcrypt==5.0.0
+
