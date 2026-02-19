@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from auth import create_access_token, get_current_user, verify_password
 from database import (
@@ -6,10 +6,14 @@ from database import (
     create_user,
     user_exists_in_db,
     get_user_activity_by_wan_ip,
-    get_traffic_summary_by_location,
-    get_traffic_by_time_range
+    get_traffic_dashboard_by_location_wanip,
+    get_traffic_dashboard_by_location,
+    get_traffic_by_time_range,
+    create_session,
+    close_session,
+    create_access_log
 )
-from models import UserRegister, UserActivityFilter, TrafficSummaryRequest, TrafficRequest
+from models import UserRegister, TrafficRequest, TrafficDashboardFilter
 
 app = FastAPI()
 
@@ -17,6 +21,43 @@ app = FastAPI()
 def read_root():
     return {"message": "Data Traffic API", "version": "1.0"}
 
+
+# ------------------- MIDDLEWARE (ACCESS LOGGING) -------------------
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    response = await call_next(request)
+
+    try:
+        if request.url.path in ["/login", "/register", "/logout", "/"]:
+            return response
+
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return response
+
+        token = auth_header.split(" ")[1]
+        payload = get_current_user(token, raw_payload=True)
+
+        session_id = payload.get("session_id")
+        user_id = payload.get("user_id")
+
+        if session_id and user_id:
+            create_access_log(
+                session_id=session_id,
+                user_id=user_id,
+                endpoint=request.url.path,
+                method=request.method,
+                status_code=response.status_code,
+                wan_ip=request.client.host
+            )
+    except Exception as e:
+        print("Access log error:", e)
+
+    return response
+
+
+# ------------------- AUTH APIs -------------------
 
 @app.post("/register")
 def register(user: UserRegister):
@@ -38,19 +79,58 @@ def register(user: UserRegister):
 
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    wan_ip = request.client.host
     user = get_user_by_username(form_data.username)
+
+    # -------- LOGIN FAILURE LOGGING --------
     if not user or not verify_password(form_data.password, user["password"]):
+        create_access_log(
+            session_id=None,
+            user_id=user["id"] if user else None,
+            endpoint="/login",
+            method="POST",
+            status_code=401,
+            wan_ip=wan_ip
+        )
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    token = create_access_token({"sub": user["username"]})
-    return {"access_token": token, "token_type": "bearer"}
+    # -------- LOGIN SUCCESS --------
+    session_id = create_session(user["id"], user["username"], wan_ip)
+    if not session_id:
+        raise HTTPException(status_code=500, detail="Failed to create session")
+
+    token = create_access_token({
+        "sub": user["username"],
+        "session_id": session_id,
+        "user_id": user["id"]
+    })
+
+    create_access_log(
+        session_id=session_id,
+        user_id=user["id"],
+        endpoint="/login",
+        method="POST",
+        status_code=200,
+        wan_ip=wan_ip
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "session_id": session_id
+    }
 
 
 @app.post("/logout")
-def logout():
-    return {"message": "Logout successful (client should delete token)"}
+def logout(current_user=Depends(get_current_user)):
+    session_id = current_user.get("session_id")
+    if session_id:
+        close_session(session_id)
+    return {"message": "Logout successful"}
 
+
+# ------------------- BUSINESS APIs -------------------
 
 @app.post("/traffic/summary")
 def get_traffic_summary(data: TrafficRequest, user=Depends(get_current_user)):
@@ -80,31 +160,32 @@ def get_traffic_summary(data: TrafficRequest, user=Depends(get_current_user)):
     }
 
 
-@app.post("/traffic/dashboard-summary")
-def traffic_dashboard_summary(request: TrafficSummaryRequest, user=Depends(get_current_user)):
-    summary = get_traffic_summary_by_location(
-        from_time=request.from_time,
-        to_time=request.to_time,
-        location=request.location
+@app.post("/traffic/location-wanip-summary")
+def traffic_location_wanip_summary(filters: TrafficDashboardFilter, current_user=Depends(get_current_user)):
+    if not filters.location:
+        raise HTTPException(status_code=400, detail="location is required")
+    if not filters.from_time or not filters.to_time:
+        raise HTTPException(status_code=400, detail="from_time and to_time are required")
+
+    data = get_traffic_dashboard_by_location(
+        filters.location,
+        filters.from_time,
+        filters.to_time
     )
 
-    return {
-        "from_time": request.from_time,
-        "to_time": request.to_time,
-        "filter_location": request.location,
-        "total_locations": len(summary),
-        "summary": summary
-    }
-
-@app.post("/user/activity-history")
-def user_activity_history(filters: UserActivityFilter, current_user=Depends(get_current_user)):
-    data = get_user_activity_by_wan_ip(filters.wan_ip, filters.from_time, filters.to_time)
+    if not data:
+        return {
+            "location": filters.location,
+            "from_time": filters.from_time,
+            "to_time": filters.to_time,
+            "summary": [],
+            "message": "No data found for given location and time range"
+        }
 
     return {
-        "wan_ip": filters.wan_ip,
+        "location": filters.location,
         "from_time": filters.from_time,
         "to_time": filters.to_time,
-        "no_of_rows": len(data),
-        "history": data
+        "total_records": len(data),
+        "summary": data
     }
-

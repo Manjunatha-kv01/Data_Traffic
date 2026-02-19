@@ -1,18 +1,21 @@
 import mysql.connector
 from mysql.connector import Error
 from typing import Optional, Tuple, List
+import uuid
 
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "127.0.0.1",
     "user": "root",
     "password": "",
     "database": "customer_portal",
-    "port": 3307
+    "port": 3306
 }
 
 def get_db_connection():
     try:
-        return mysql.connector.connect(**DB_CONFIG)
+        conn = mysql.connector.connect(**DB_CONFIG)
+        conn.autocommit = False
+        return conn
     except Error as e:
         print(f"MySQL connection error: {e}")
         return None
@@ -26,8 +29,7 @@ def get_user_by_username(username: str) -> Optional[dict]:
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
-        user = cursor.fetchone()
-        return user
+        return cursor.fetchone()
     except Error as e:
         print(f"DB error in get_user_by_username: {e}")
         return None
@@ -101,7 +103,8 @@ def get_traffic_by_time_range(wan_ip: str, from_time: str, to_time: str) -> Tupl
         rows = cursor.fetchall()
 
         cursor.execute(count_query, (wan_ip, from_time, to_time))
-        count = cursor.fetchone()["total_rows"]
+        row = cursor.fetchone()
+        count = row["total_rows"] if row else 0
 
         return rows, count
 
@@ -116,49 +119,84 @@ def get_traffic_by_time_range(wan_ip: str, from_time: str, to_time: str) -> Tupl
             pass
 
 
-def get_traffic_summary_by_location(from_time: str, to_time: str, location: str = None) -> List[dict]:
+def get_traffic_dashboard_by_location_wanip(location: str, wan_ip: str, from_time: str, to_time: str):
     conn = get_db_connection()
     if not conn:
-        return []
+        return None
 
     try:
         cursor = conn.cursor(dictionary=True)
 
-        conditions = ["t.time_hour BETWEEN %s AND %s"]
-        params = [from_time, to_time]
-
-        if location:
-            conditions.append("b.node = %s")
-            params.append(location)
-
-        where_clause = " AND ".join(conditions)
-
-        query = f"""
+        query = """
         SELECT
             b.node AS location,
-            b.wanip AS wan_ip,
+            t.wan_ip,
+            b.bandwidth,
+            COUNT(*) AS data_points,
+            ROUND(AVG(t.in_traffic), 2) AS avg_in,
+            ROUND(AVG(t.out_traffic), 2) AS avg_out,
+            MAX(t.in_traffic) AS peak_in,
+            MAX(t.out_traffic) AS peak_out,
+            MIN(t.reading_time) AS first_reading,
+            MAX(t.reading_time) AS last_reading
+        FROM traffic_logs t
+        JOIN bmap_link_master b ON b.wanip = t.wan_ip
+        WHERE b.node = %s
+          AND t.wan_ip = %s
+          AND t.reading_time BETWEEN %s AND %s
+        GROUP BY b.node, t.wan_ip, b.bandwidth
+        """
+
+        cursor.execute(query, (location, wan_ip, from_time, to_time))
+        return cursor.fetchone()
+
+    except Error as e:
+        print(f"DB error in get_traffic_dashboard_by_location_wanip: {e}")
+        return None
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+
+def get_traffic_dashboard_by_location(location: str, from_time: str, to_time: str):
+    conn = get_db_connection()
+    if not conn:
+        return None
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        query = """
+        SELECT
+            b.node AS location,
+            t.wan_ip,
+            b.interface,
+            b.description,
             b.bandwidth,
             COUNT(*) AS data_points,
             ROUND(AVG(t.in_avg), 2) AS avg_in,
             ROUND(AVG(t.out_avg), 2) AS avg_out,
-            ROUND(MAX(t.in_max), 2) AS peak_in,
-            ROUND(MAX(t.out_max), 2) AS peak_out,
+            MAX(t.in_max) AS peak_in,
+            MAX(t.out_max) AS peak_out,
             MIN(t.time_hour) AS first_reading,
             MAX(t.time_hour) AS last_reading
-        FROM bmap_link_master b
-        INNER JOIN traffic_hourly_copy t ON t.wan_ip = b.wanip
-        WHERE {where_clause}
-        GROUP BY b.node, b.wanip, b.bandwidth
-        ORDER BY b.node ASC
+        FROM traffic_hourly_copy t
+        JOIN bmap_link_master b ON b.wanip = t.wan_ip
+        WHERE b.node = %s
+          AND t.time_hour BETWEEN %s AND %s
+        GROUP BY b.node, t.wan_ip, b.interface, b.description, b.bandwidth
+        ORDER BY t.wan_ip
         """
 
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        return rows
+        cursor.execute(query, (location, from_time, to_time))
+        return cursor.fetchall()
 
-    except Exception as e:
-        print("DB error in get_traffic_summary_by_location:", e)
-        return []
+    except Error as e:
+        print(f"DB error in get_traffic_dashboard_by_location: {e}")
+        return None
     finally:
         try:
             cursor.close()
@@ -184,7 +222,7 @@ def get_user_activity_by_wan_ip(wan_ip: str, from_time: str, to_time: str):
             us.resource_value,
             blm.wanip AS wan_ip,
             s.login_time,
-            a.logout_time
+            s.logout_time
         FROM users_scope us
         JOIN users u 
             ON u.id = us.user_id
@@ -192,10 +230,8 @@ def get_user_activity_by_wan_ip(wan_ip: str, from_time: str, to_time: str):
             ON ur.resource_id = us.resource_id
         LEFT JOIN bmap_link_master blm 
             ON blm.wanip = us.resource_value
-        LEFT JOIN session s 
+        LEFT JOIN sessions s 
             ON s.user_id = u.id AND s.wan_ip = blm.wanip
-        LEFT JOIN access a 
-            ON a.user_id = u.id AND a.wan_ip = blm.wanip
         WHERE ur.resource_name = 'WANIP'
           AND blm.wanip = %s
           AND s.login_time BETWEEN %s AND %s
@@ -203,12 +239,99 @@ def get_user_activity_by_wan_ip(wan_ip: str, from_time: str, to_time: str):
         """
 
         cursor.execute(query, (wan_ip, from_time, to_time))
-        rows = cursor.fetchall()
-        return rows
+        return cursor.fetchall()
 
     except Exception as e:
         print("DB error in get_user_activity_by_wan_ip:", e)
         return []
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+
+def create_session(user_id: int, username: str, wan_ip: str):
+    conn = get_db_connection()
+    if not conn:
+        print("DB connection failed in create_session")
+        return None
+
+    try:
+        session_id = str(uuid.uuid4())
+        cursor = conn.cursor()
+        query = """
+        INSERT INTO sessions (session_id, user_id, wan_ip, status)
+        VALUES (%s, %s, %s, 'ACTIVE')
+        """
+        cursor.execute(query, (session_id, user_id, wan_ip))
+        conn.commit()
+        return session_id
+    except Error as e:
+        print("DB error in create_session:", e)
+        return None
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+
+def close_session(session_id: str):
+    conn = get_db_connection()
+    if not conn:
+        print("DB connection failed in close_session")
+        return False
+
+    try:
+        cursor = conn.cursor()
+        query = """
+        UPDATE sessions
+        SET logout_time = NOW(), status = 'LOGGED_OUT'
+        WHERE session_id = %s
+        """
+        cursor.execute(query, (session_id,))
+        conn.commit()
+        return True
+    except Error as e:
+        print("DB error in close_session:", e)
+        return False
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+
+def create_access_log(
+    session_id: Optional[str],
+    user_id: Optional[int],
+    endpoint: str,
+    method: str,
+    status_code: int,
+    wan_ip: str
+):
+    conn = get_db_connection()
+    if not conn:
+        print("DB connection failed in create_access_log")
+        return False
+
+    try:
+        cursor = conn.cursor()
+        query = """
+        INSERT INTO access_logs 
+        (session_id, user_id, endpoint, method, status_code, wan_ip)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(query, (session_id, user_id, endpoint, method, status_code, wan_ip))
+        conn.commit()
+        return True
+    except Error as e:
+        print("DB error in create_access_log:", e)
+        return False
     finally:
         try:
             cursor.close()
