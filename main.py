@@ -5,8 +5,6 @@ from database import (
     get_user_by_username,
     create_user,
     user_exists_in_db,
-    get_user_activity_by_wan_ip,
-    get_traffic_dashboard_by_location_wanip,
     get_traffic_dashboard_by_location,
     get_traffic_by_time_range,
     create_session,
@@ -60,22 +58,37 @@ async def log_requests(request: Request, call_next):
 # ------------------- AUTH APIs -------------------
 
 @app.post("/register")
-def register(user: UserRegister):
-    if len(user.username) < 3:
-        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
-    if len(user.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    if user.password != user.confirm_password:
-        raise HTTPException(status_code=400, detail="Passwords do not match")
+def register(request: Request, user: UserRegister):
+    wan_ip = request.client.host
 
-    if user_exists_in_db(user.username):
-        raise HTTPException(status_code=400, detail="Username already exists")
+    try:
+        if len(user.username) < 3:
+            create_access_log(None, None, "/register", "POST", 400, wan_ip)
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
 
-    success, message = create_user(user.username, user.password, user.user_display_name)
-    if not success:
-        raise HTTPException(status_code=500, detail=message)
+        if len(user.password) < 6:
+            create_access_log(None, None, "/register", "POST", 400, wan_ip)
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    return {"message": "User registered successfully"}
+        if user.password != user.confirm_password:
+            create_access_log(None, None, "/register", "POST", 400, wan_ip)
+            raise HTTPException(status_code=400, detail="Passwords do not match")
+
+        if user_exists_in_db(user.username):
+            create_access_log(None, None, "/register", "POST", 400, wan_ip)
+            raise HTTPException(status_code=400, detail="Username already exists")
+
+        success, message = create_user(user.username, user.password, user.user_display_name)
+        if not success:
+            create_access_log(None, None, "/register", "POST", 500, wan_ip)
+            raise HTTPException(status_code=500, detail=message)
+
+        create_access_log(None, None, "/register", "POST", 201, wan_ip)
+        return {"message": "User registered successfully"}
+
+    except Exception as e:
+        print("Register error:", e)
+        raise
 
 
 @app.post("/login")
@@ -83,43 +96,32 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     wan_ip = request.client.host
     user = get_user_by_username(form_data.username)
 
-    # -------- LOGIN FAILURE LOGGING --------
-    if not user or not verify_password(form_data.password, user["password"]):
-        create_access_log(
-            session_id=None,
-            user_id=user["id"] if user else None,
-            endpoint="/login",
-            method="POST",
-            status_code=401,
-            wan_ip=wan_ip
-        )
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    try:
+        if not user or not verify_password(form_data.password, user["password"]):
+            create_access_log(None, user["id"] if user else None, "/login", "POST", 401, wan_ip)
+            raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    # -------- LOGIN SUCCESS --------
-    session_id = create_session(user["id"], user["username"], wan_ip)
-    if not session_id:
-        raise HTTPException(status_code=500, detail="Failed to create session")
+        session_id = create_session(user["id"], user["username"], wan_ip)
+        if not session_id:
+            raise HTTPException(status_code=500, detail="Failed to create session")
 
-    token = create_access_token({
-        "sub": user["username"],
-        "session_id": session_id,
-        "user_id": user["id"]
-    })
+        token = create_access_token({
+            "sub": user["username"],
+            "session_id": session_id,
+            "user_id": user["id"]
+        })
 
-    create_access_log(
-        session_id=session_id,
-        user_id=user["id"],
-        endpoint="/login",
-        method="POST",
-        status_code=200,
-        wan_ip=wan_ip
-    )
+        create_access_log(session_id, user["id"], "/login", "POST", 200, wan_ip)
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "session_id": session_id
-    }
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "session_id": session_id
+        }
+
+    except Exception as e:
+        print("Login error:", e)
+        raise
 
 
 @app.post("/logout")
@@ -134,24 +136,20 @@ def logout(current_user=Depends(get_current_user)):
 
 @app.post("/traffic/summary")
 def get_traffic_summary(data: TrafficRequest, user=Depends(get_current_user)):
-    wan_ip = data.wan_ip
-    from_time = data.from_time
-    to_time = data.to_time
-
-    if not wan_ip:
+    if not data.wan_ip:
         raise HTTPException(status_code=400, detail="wan_ip is required")
 
-    if not from_time or not to_time:
+    if not data.from_time or not data.to_time:
         raise HTTPException(status_code=400, detail="from_time and to_time are required")
 
-    rows, count = get_traffic_by_time_range(wan_ip, from_time, to_time)
+    rows, count = get_traffic_by_time_range(data.wan_ip, data.from_time, data.to_time)
 
     if rows is None:
         raise HTTPException(status_code=500, detail="Database error")
 
     return {
-        "starting_time": from_time,
-        "ending_time": to_time,
+        "starting_time": data.from_time,
+        "ending_time": data.to_time,
         "status": "success" if count > 0 else "no data",
         "payload": {
             "no_of_rows": count,
@@ -164,6 +162,7 @@ def get_traffic_summary(data: TrafficRequest, user=Depends(get_current_user)):
 def traffic_location_wanip_summary(filters: TrafficDashboardFilter, current_user=Depends(get_current_user)):
     if not filters.location:
         raise HTTPException(status_code=400, detail="location is required")
+
     if not filters.from_time or not filters.to_time:
         raise HTTPException(status_code=400, detail="from_time and to_time are required")
 
